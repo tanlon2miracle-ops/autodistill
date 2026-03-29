@@ -1,0 +1,32 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+dist/
+build/
+.eggs/
+
+# Data & Cache
+~/.cache/autodistill/
+*.pt
+*.bin
+*.safetensors
+
+# Experiment logs
+run.log
+results.tsv
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# uv
+.venv/
+uv.lock
+
+# OS
+.DS_Store
+Thumbs.db

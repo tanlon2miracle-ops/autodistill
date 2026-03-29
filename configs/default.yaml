@@ -1,0 +1,41 @@
+# autodistill 默认配置
+# Agent 不修改此文件；超参在 distill.py 中直接调整
+
+# Student 选择
+student:
+  name: "qwen3-0.8b"
+  from_pretrained: true
+
+# Teacher（用于 prepare.py 缓存生成）
+teacher:
+  name: "Qwen/Qwen3-235B"
+
+# 蒸馏超参
+distillation:
+  temperature: 4.0
+  alpha: 0.7                  # soft label loss 权重
+  learning_rate: 2.0e-5
+  batch_size: 32
+  gradient_accumulation: 4
+  warmup_ratio: 0.1
+  weight_decay: 0.01
+  max_grad_norm: 1.0
+  mode: "logit"               # logit / feature / attention / progressive
+
+# 训练
+training:
+  time_budget: 900            # 秒（15 分钟）
+  max_seq_len: 2048
+  seed: 42
+  fp16: false
+  bf16: true
+
+# 数据
+data:
+  cache_dir: "~/.cache/autodistill"
+  num_workers: 4
+
+# 评估
+eval:
+  eval_samples: 500
+  eval_interval_steps: 50     # 每 N 步评估一次
