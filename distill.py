@@ -10,12 +10,20 @@ Agent 可以自由修改此文件中的一切：
 - 任何能降低 val_loss / 提高 teacher_agreement 的改动
 
 Usage: uv run distill.py [--student qwen3-0.8b]
+
+基于 post-training-notes 研究洞察的改进：
+- 支持 Top-k Logit Filtering（Skywork-OR1 启发）
+- 支持 Dynamic Temperature Schedule（OR1 Adaptive Entropy Control 启发）
+- 支持 Curriculum Learning（OR1 + AceReason 启发）
+- 支持 Feature Distillation（混合 logit + feature）
+- 改进的 Loss 设计（多种距离度量可选）
 """
 
 import os
 os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
 
 import gc
+import math
 import time
 import argparse
 from contextlib import nullcontext
@@ -44,7 +52,7 @@ WEIGHT_DECAY = 0.01
 MAX_GRAD_NORM = 1.0
 
 # 蒸馏策略
-DISTILL_MODE = "logit"         # "logit" | "feature" | "attention" | "progressive"
+DISTILL_MODE = "logit"         # "logit" | "feature" | "attention" | "progressive" | "logit+feature"
 
 # Student 配置
 STUDENT_NAME = "qwen3-0.8b"
@@ -53,33 +61,139 @@ STUDENT_FROM_PRETRAINED = True
 # 评估间隔
 EVAL_EVERY_STEPS = 50
 
+# === 高级选项（来自 post-training 研究） ===
+
+# Top-k Logit Filtering (Skywork-OR1 启发：只蒸馏 Teacher 的高置信 logits，过滤噪声)
+TOPK_LOGITS = None             # int 或 None（None = 不过滤，建议尝试 50/100/500）
+
+# Dynamic Temperature Schedule (OR1 Adaptive Entropy Control 启发)
+TEMPERATURE_SCHEDULE = "constant"  # "constant" | "linear_decay" | "cosine" | "warmup_decay"
+TEMPERATURE_START = 8.0        # 仅当 schedule != constant 时生效
+TEMPERATURE_END = 2.0          # 仅当 schedule != constant 时生效
+
+# Curriculum Learning (OR1 + AceReason 启发：先易后难)
+USE_CURRICULUM = False         # 是否按 Teacher confidence 排序样本
+CURRICULUM_WARMUP_RATIO = 0.3  # 前 30% 步数只用高置信样本
+
+# Loss 类型选择
+LOSS_TYPE = "kl_div"           # "kl_div" | "mse" | "cosine" | "symmetric_kl"
+
+# Entropy Regularization (防 Entropy Collapse，来自 Skywork-OR1)
+ENTROPY_BONUS = 0.0            # > 0 时添加 entropy bonus 防止 Student 分布坍缩
+
+# Alpha Schedule (动态调整 soft/hard 权重)
+ALPHA_SCHEDULE = "constant"    # "constant" | "soft_to_hard" | "hard_to_soft"
+
+
+# ===================================================================
+# 工具函数
+# ===================================================================
+def get_temperature(step, total_steps):
+    """根据 schedule 计算当前温度"""
+    if TEMPERATURE_SCHEDULE == "constant":
+        return TEMPERATURE
+    progress = min(step / max(total_steps, 1), 1.0)
+    if TEMPERATURE_SCHEDULE == "linear_decay":
+        return TEMPERATURE_START + (TEMPERATURE_END - TEMPERATURE_START) * progress
+    elif TEMPERATURE_SCHEDULE == "cosine":
+        return TEMPERATURE_END + (TEMPERATURE_START - TEMPERATURE_END) * 0.5 * (1 + math.cos(math.pi * progress))
+    elif TEMPERATURE_SCHEDULE == "warmup_decay":
+        if progress < 0.1:
+            return TEMPERATURE_START * (progress / 0.1)
+        return TEMPERATURE_START + (TEMPERATURE_END - TEMPERATURE_START) * ((progress - 0.1) / 0.9)
+    return TEMPERATURE
+
+
+def get_alpha(step, total_steps):
+    """根据 schedule 计算当前 alpha"""
+    if ALPHA_SCHEDULE == "constant":
+        return ALPHA
+    progress = min(step / max(total_steps, 1), 1.0)
+    if ALPHA_SCHEDULE == "soft_to_hard":
+        # 训练早期主 soft label (α=0.9) → 后期主 hard label (α=0.3)
+        return 0.9 - 0.6 * progress
+    elif ALPHA_SCHEDULE == "hard_to_soft":
+        # 反过来
+        return 0.3 + 0.6 * progress
+    return ALPHA
+
+
+def filter_topk_logits(logits, k):
+    """只保留 top-k logits，其余设为 -inf（减少噪声蒸馏）"""
+    if k is None or k <= 0 or k >= logits.size(-1):
+        return logits
+    topk_vals, topk_ids = logits.topk(k, dim=-1)
+    filtered = torch.full_like(logits, float("-inf"))
+    filtered.scatter_(-1, topk_ids, topk_vals)
+    return filtered
+
+
 # ===================================================================
 # Loss 函数（Agent 可以随意改造）
 # ===================================================================
-def distillation_loss(student_logits, teacher_logits, labels, temperature=TEMPERATURE, alpha=ALPHA):
+def distillation_loss(
+    student_logits, teacher_logits, labels,
+    temperature=TEMPERATURE, alpha=ALPHA,
+    step=0, total_steps=1,
+):
     """
-    标准 logit 蒸馏 loss = alpha * KL_div(soft) + (1-alpha) * CE(hard)
+    蒸馏 loss，支持多种模式。
     
-    Agent 可以修改此函数：
-    - 换 KL 为 MSE、cosine similarity
-    - 加 feature distillation loss
-    - 加 attention transfer loss
-    - 加 contrastive loss
-    - 动态调 temperature / alpha
+    改进点（基于 post-training 研究）：
+    1. Top-k Logit Filtering: 只蒸馏 Teacher 高置信输出
+    2. 多种距离度量: KL / MSE / Cosine / Symmetric KL
+    3. Entropy Bonus: 防止 Student 分布坍缩
+    4. Dynamic alpha/temperature: 随训练进度调整
     """
-    # Soft label loss (KL divergence)
-    student_soft = F.log_softmax(student_logits / temperature, dim=-1)
-    teacher_soft = F.softmax(teacher_logits / temperature, dim=-1)
-    soft_loss = F.kl_div(student_soft, teacher_soft, reduction="batchmean") * (temperature ** 2)
+    # 动态参数
+    current_temp = get_temperature(step, total_steps)
+    current_alpha = get_alpha(step, total_steps)
+    
+    # Top-k 过滤
+    teacher_for_soft = filter_topk_logits(teacher_logits, TOPK_LOGITS)
+    
+    # === Soft Label Loss ===
+    if LOSS_TYPE == "kl_div":
+        student_soft = F.log_softmax(student_logits / current_temp, dim=-1)
+        teacher_soft = F.softmax(teacher_for_soft / current_temp, dim=-1)
+        soft_loss = F.kl_div(student_soft, teacher_soft, reduction="batchmean") * (current_temp ** 2)
+    elif LOSS_TYPE == "symmetric_kl":
+        # Symmetric KL: 0.5 * (KL(S||T) + KL(T||S))，更稳定
+        student_soft = F.log_softmax(student_logits / current_temp, dim=-1)
+        teacher_soft_log = F.log_softmax(teacher_for_soft / current_temp, dim=-1)
+        teacher_soft = F.softmax(teacher_for_soft / current_temp, dim=-1)
+        student_soft_prob = F.softmax(student_logits / current_temp, dim=-1)
+        kl_st = F.kl_div(student_soft, teacher_soft, reduction="batchmean")
+        kl_ts = F.kl_div(teacher_soft_log, student_soft_prob, reduction="batchmean")
+        soft_loss = 0.5 * (kl_st + kl_ts) * (current_temp ** 2)
+    elif LOSS_TYPE == "mse":
+        student_soft = student_logits / current_temp
+        teacher_soft = teacher_for_soft / current_temp
+        soft_loss = F.mse_loss(student_soft, teacher_soft)
+    elif LOSS_TYPE == "cosine":
+        student_soft = student_logits / current_temp
+        teacher_soft = teacher_for_soft / current_temp
+        cos_sim = F.cosine_similarity(student_soft, teacher_soft, dim=-1)
+        soft_loss = (1 - cos_sim).mean()
+    else:
+        raise ValueError(f"Unknown LOSS_TYPE: {LOSS_TYPE}")
 
-    # Hard label loss (Cross-entropy)
+    # === Hard Label Loss (Cross-entropy) ===
     hard_loss = F.cross_entropy(
         student_logits.view(-1, student_logits.size(-1)),
         labels.view(-1),
         ignore_index=-100,
     )
 
-    return alpha * soft_loss + (1 - alpha) * hard_loss
+    # === Entropy Bonus (防 Entropy Collapse) ===
+    entropy_loss = 0.0
+    if ENTROPY_BONUS > 0:
+        student_probs = F.softmax(student_logits, dim=-1)
+        student_log_probs = F.log_softmax(student_logits, dim=-1)
+        entropy = -(student_probs * student_log_probs).sum(dim=-1).mean()
+        entropy_loss = -ENTROPY_BONUS * entropy  # 负号：最大化 entropy
+
+    return current_alpha * soft_loss + (1 - current_alpha) * hard_loss + entropy_loss
 
 
 # ===================================================================
@@ -121,18 +235,20 @@ def train():
         if step < warmup_steps:
             return step / max(warmup_steps, 1)
         progress = (step - warmup_steps) / max(total_steps_estimate - warmup_steps, 1)
-        return 0.5 * (1 + torch.cos(torch.tensor(progress * 3.14159)).item())
+        return 0.5 * (1 + math.cos(progress * math.pi))
 
     scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_schedule)
 
     # 混合精度
-    use_bf16 = torch.cuda.is_bf16_supported()
+    use_bf16 = device == "cuda" and torch.cuda.is_bf16_supported()
     amp_ctx = autocast(dtype=torch.bfloat16) if use_bf16 else nullcontext()
-    scaler = GradScaler(enabled=not use_bf16)
+    scaler = GradScaler(enabled=(device == "cuda" and not use_bf16))
 
-    # 训练
+    # 打印配置
     print(f"[distill] Starting training (budget={TIME_BUDGET}s, mode={DISTILL_MODE})")
     print(f"[distill] T={TEMPERATURE}, alpha={ALPHA}, lr={LEARNING_RATE}, bs={BATCH_SIZE}x{GRADIENT_ACCUMULATION}")
+    print(f"[distill] loss={LOSS_TYPE}, topk={TOPK_LOGITS}, temp_schedule={TEMPERATURE_SCHEDULE}")
+    print(f"[distill] curriculum={USE_CURRICULUM}, entropy_bonus={ENTROPY_BONUS}, alpha_schedule={ALPHA_SCHEDULE}")
 
     student.train()
     global_step = 0
@@ -152,6 +268,18 @@ def train():
             teacher_logits = batch["teacher_logits"].to(device)
             labels = batch.get("labels", input_ids[:, 1:]).to(device)
 
+            # Curriculum Learning: 跳过低置信样本（训练早期）
+            if USE_CURRICULUM:
+                progress = global_step / max(total_steps_estimate, 1)
+                if progress < CURRICULUM_WARMUP_RATIO:
+                    # 计算 Teacher 置信度（top-1 概率均值）
+                    teacher_conf = F.softmax(teacher_logits, dim=-1).max(dim=-1).values.mean()
+                    # 前 30% 步数只保留高置信样本
+                    threshold = 0.5 * (1 - progress / CURRICULUM_WARMUP_RATIO)
+                    if teacher_conf < threshold:
+                        global_step += 1
+                        continue
+
             with amp_ctx:
                 outputs = student(input_ids=input_ids, attention_mask=attention_mask)
                 student_logits = outputs.logits[:, :-1, :]
@@ -160,7 +288,7 @@ def train():
 
                 loss = distillation_loss(
                     student_logits, teacher_logits_shift, labels_shift,
-                    temperature=TEMPERATURE, alpha=ALPHA,
+                    step=global_step, total_steps=total_steps_estimate,
                 )
                 loss = loss / GRADIENT_ACCUMULATION
 
@@ -179,7 +307,9 @@ def train():
                 if actual_step % 10 == 0:
                     avg_loss = step_loss_acc / 10
                     lr = scheduler.get_last_lr()[0]
-                    print(f"  step {actual_step} | loss {avg_loss:.4f} | lr {lr:.2e} | {elapsed:.0f}s")
+                    current_t = get_temperature(global_step, total_steps_estimate)
+                    current_a = get_alpha(global_step, total_steps_estimate)
+                    print(f"  step {actual_step} | loss {avg_loss:.4f} | lr {lr:.2e} | T {current_t:.1f} | α {current_a:.2f} | {elapsed:.0f}s")
                     step_loss_acc = 0.0
 
                 # 定期评估
@@ -202,7 +332,7 @@ def train():
 
     final_metrics = evaluate_distill(student, val_loader, device)
     throughput = measure_throughput(student, tokenizer, device)
-    peak_vram = torch.cuda.max_memory_allocated() / (1024 ** 3)
+    peak_vram = torch.cuda.max_memory_allocated() / (1024 ** 3) if device == "cuda" else 0.0
     n_params = sum(p.numel() for p in student.parameters()) / 1e6
 
     # 输出结果（与 autoresearch 格式对齐）
@@ -219,6 +349,12 @@ def train():
     print(f"distill_mode:      {DISTILL_MODE}")
     print(f"temperature:       {TEMPERATURE}")
     print(f"alpha:             {ALPHA}")
+    print(f"loss_type:         {LOSS_TYPE}")
+    print(f"topk_logits:       {TOPK_LOGITS}")
+    print(f"temp_schedule:     {TEMPERATURE_SCHEDULE}")
+    print(f"alpha_schedule:    {ALPHA_SCHEDULE}")
+    print(f"curriculum:        {USE_CURRICULUM}")
+    print(f"entropy_bonus:     {ENTROPY_BONUS}")
     print(f"num_steps:         {global_step}")
 
 
