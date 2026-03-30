@@ -26,6 +26,7 @@ import gc
 import math
 import time
 import argparse
+from pathlib import Path
 from contextlib import nullcontext
 
 import torch
@@ -326,6 +327,26 @@ def train():
         if elapsed >= TIME_BUDGET:
             break
 
+
+    # 保存 checkpoint
+    ckpt_dir = Path("checkpoints")
+    ckpt_dir.mkdir(exist_ok=True)
+    ckpt_path = ckpt_dir / f"latest_{student_name}.pt"
+    torch.save({
+        "model_state_dict": student.state_dict(),
+        "optimizer_state_dict": optimizer.state_dict(),
+        "global_step": global_step,
+        "best_val_loss": best_val_loss,
+        "config": {
+            "temperature": TEMPERATURE,
+            "alpha": ALPHA,
+            "learning_rate": LEARNING_RATE,
+            "batch_size": BATCH_SIZE,
+            "distill_mode": DISTILL_MODE,
+            "student_name": student_name,
+        },
+    }, ckpt_path)
+    print(f"[distill] Checkpoint saved to {ckpt_path}")
     # 最终评估
     total_time = time.perf_counter() - train_start
     print("\n[distill] Training complete. Running final evaluation...")
